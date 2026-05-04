@@ -1,0 +1,25 @@
+# Sensitive config (use config.example.yaml as template)
+config/config.yaml
+
+# Chrome debug profile (contains cookies, login data, session data)
+debug-chrome/
+
+# Runtime state and logs
+state.json
+logs/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db

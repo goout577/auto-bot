@@ -1,0 +1,43 @@
+exchange:
+  api_key: "YOUR_EXCHANGE_API_KEY"
+  secret_key: "YOUR_EXCHANGE_SECRET_KEY"
+  passphrase: "YOUR_EXCHANGE_PASSPHRASE"
+  testnet: true          # true=模拟盘，false=实盘
+
+ai:
+  base_url: "https://api.anthropic.com/v1"   # 或聚合平台地址
+  api_key: "YOUR_AI_API_KEY"
+  model: "claude-opus-4-7"
+
+proxy:
+  http: "http://127.0.0.1:7890"
+  https: "http://127.0.0.1:7890"
+
+external_apis:
+  cryptopanic_token: ""   # 可选，留空自动跳过
+  coingecko_demo_key: ""  # 可选，留空自动跳过
+
+trading:
+  timeframe: "15m"
+  loop_interval_minutes: 60
+  ohlcv_limit: 100
+
+risk:
+  max_position_pct: 30.0    # 单笔最多占权益 30%
+  max_leverage: 15
+  min_confidence: 6
+  min_balance_usdt: 8.0
+  max_open_positions: 1
+
+screener:
+  min_volume_24h_usdt: 5000000
+  max_contract_notional_usdt: 200.0
+  top_n: 10
+  excluded_bases:
+    - BTC
+    - ETH
+    - USDC
+    - USDT
+    - DAI
+    - BUSD
+    - FDUSD
