@@ -11,11 +11,10 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from agent.brain import review_loss_trade
-from agent.context_builder import format_trade_card
+from agent.brain import make_decision, review_failure
+from agent.context_builder import build_context, format_trade_card
 from agent.executor import execute
-from agent.loss_tracker import detect_closed_losses, register_open_trade
-from agent.rule_engine import build_rule_trade_card
+from agent.loss_tracker import build_failed_attempt, detect_closed_losses, register_open_trade
 from collectors.market import fetch_market_snapshots
 from collectors.screener import screen_symbols
 from core.env_loader import apply_env_config, load_env_file
@@ -45,6 +44,7 @@ def load_state() -> dict:
     state.setdefault("trade_records", [])
     state.setdefault("open_trades", {})
     state.setdefault("closed_trades", [])
+    state.setdefault("reviewed_failures", {})
     state.setdefault("consecutive_losses", 0)
     return state
 
@@ -109,15 +109,28 @@ def _candidate_allows_open(decision: dict, candidates: list, min_score: int) -> 
     return True, "ok"
 
 
+def review_failure_once(state: dict, cfg: dict, failure: dict | None):
+    if not failure:
+        return
+    key = str(failure.get("trade_key") or failure.get("symbol") or _now().isoformat())
+    reviewed = state.setdefault("reviewed_failures", {})
+    if reviewed.get(key):
+        return
+    logger.info(f"触发 LLM 失败复盘: {failure.get('symbol')} type={failure.get('failure_type')}")
+    review = review_failure(failure, cfg["ai"])
+    record_loss_review(time_utc=_now().isoformat(), trade=failure, review=review)
+    reviewed[key] = _now().isoformat()
+
+
 def review_closed_losses(exchange: OKXExchange, positions: list[dict], state: dict, cfg: dict):
     for loss_trade in detect_closed_losses(exchange, positions, state):
-        logger.info(f"检测到真实亏损交易，触发 LLM 复盘: {loss_trade.get('symbol')} pnl={loss_trade.get('realized_pnl')}")
-        review = review_loss_trade(loss_trade, cfg["ai"])
-        record_loss_review(time_utc=_now().isoformat(), trade=loss_trade, review=review)
+        loss_trade["failure_type"] = "closed_loss"
+        review_failure_once(state, cfg, loss_trade)
 
 
 def run_once(exchange: OKXExchange, cfg: dict, state: dict):
-    logger.info(f"=== Cycle {state['cycle_count'] + 1}: yaobi short-squeeze scan ===")
+    cycle_count = state["cycle_count"] + 1
+    logger.info(f"=== Cycle {cycle_count}: yaobi short-squeeze scan ===")
 
     account = exchange.get_usdt_account_snapshot()
     equity = float(account.get("equity") or 0)
@@ -135,7 +148,8 @@ def run_once(exchange: OKXExchange, cfg: dict, state: dict):
     candidates = screen_symbols(exchange, cfg["screener"])
     candidates = fetch_market_snapshots(exchange, candidates, cfg["trading"], cfg["screener"])
 
-    decision = build_rule_trade_card(candidates, cfg["risk"], cfg["screener"])
+    context = build_context(equity, balance, positions, candidates, cfg["risk"], state)
+    decision = make_decision(context, cfg["ai"], cfg["risk"].get("position_margin_pct", 10))
     logger.info("\n" + format_trade_card(decision))
 
     min_score = int(cfg.get("screener", {}).get("min_yaobi_score", 55))
@@ -151,15 +165,20 @@ def run_once(exchange: OKXExchange, cfg: dict, state: dict):
         if execution_mode == "advice_only":
             result = {"status": "advice_only"}
         else:
-            result = execute(decision, exchange, cfg["risk"])
+            try:
+                result = execute(decision, exchange, cfg["risk"])
+            except Exception as e:
+                logger.exception("execution failed")
+                result = {"status": "execution_failed", "reason": str(e)}
         logger.info("\n" + format_trade_card(decision, result))
         logger.info(f"execution result: {result}")
 
+    review_failure_once(state, cfg, build_failed_attempt(cycle_count, decision, result, candidates, equity))
     register_open_trade(state, decision, result, candidates)
 
     record_cycle(
         time_utc=_now().isoformat(),
-        cycle_count=state["cycle_count"] + 1,
+        cycle_count=cycle_count,
         equity=equity,
         balance=balance,
         positions_count=len(positions),
@@ -225,12 +244,11 @@ def main():
 
     logger.info(
         f"agent start | mode=OKX testnet | execution={cfg['trading'].get('execution_mode', 'auto_testnet')} "
-        f"| interval={interval_sec // 60} min | llm_role=loss_review | llm={cfg['ai'].get('model')}"
+        f"| interval={interval_sec // 60} min | llm_role=decision_and_failure_review | llm={cfg['ai'].get('model')}"
     )
     logger.info(f"history cycles: {state['cycle_count']} | last action: {state.get('last_action', 'none')}")
 
     wait_for_next_cycle(state, interval_sec)
-
     exchange = OKXExchange(cfg["exchange"], proxy=cfg.get("proxy", {}))
 
     while True:

@@ -44,6 +44,30 @@ def register_open_trade(state: dict, decision: dict, result: dict, candidates: l
     }
 
 
+def build_failed_attempt(cycle_count: int, decision: dict, result: dict, candidates: list[dict], equity: float) -> dict | None:
+    action = decision.get("action")
+    status = result.get("status")
+    if action not in ("open_long", "open_short"):
+        return None
+    if status in ("opened", "advice_only"):
+        return None
+
+    symbol = decision.get("symbol")
+    candidate = next((c for c in candidates if c.get("symbol") == symbol), {})
+    return {
+        "trade_key": f"cycle:{cycle_count}:{symbol or '-'}:{status or 'unknown'}",
+        "failure_type": "sim_testnet_failure",
+        "symbol": symbol,
+        "action": action,
+        "realized_pnl": None,
+        "equity": equity,
+        "decision": decision,
+        "result": result,
+        "candidate_snapshot": candidate,
+        "failed_at": _now_iso(),
+    }
+
+
 def detect_closed_losses(exchange, positions: list[dict], state: dict) -> list[dict]:
     open_trades = state.setdefault("open_trades", {})
     active_symbols = {p.get("symbol") for p in positions}

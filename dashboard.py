@@ -183,9 +183,9 @@ def render_trade_card(trade: dict):
     if not trade:
         st.info("还没有规则交易卡。机器人跑完第一轮后这里会出现记录。")
         return
-    source = "规则" if (trade.get("raw_json") or "").find("rules") >= 0 else "系统"
+    source = "LLM" if (trade.get("raw_json") or "").find("llm") >= 0 else "系统"
     st.subheader(f"{trade.get('symbol') or '-'} | {trade.get('action') or '-'} | {trade.get('status') or '-'}")
-    st.caption(f"决策来源：{source}。LLM 只用于亏损复盘，不参与实时开仓。")
+    st.caption(f"决策来源：{source}。模拟盘失败和真实亏损都会进入复盘建议池。")
     cols = st.columns(4)
     cols[0].metric("阶段", trade.get("stage") or "-")
     cols[1].metric("信心", f"{trade.get('confidence') or '-'} / 10")
@@ -203,7 +203,7 @@ def render_trade_card(trade: dict):
 def main():
     render_bot_controls()
     st.title("OKX 测试盘妖币逼空机器人")
-    st.caption("只看 U 本位：规则交易卡、可用保证金、实时仓位、权益曲线和亏损复盘。")
+    st.caption("只看 U 本位：LLM 交易卡、可用保证金、实时仓位、权益曲线和失败复盘。")
 
     state = load_state()
     cfg = load_config()
@@ -212,7 +212,7 @@ def main():
     render_top_metrics(state, cfg, account)
 
     tab_account, tab_positions, tab_candidates, tab_trades, tab_reviews, tab_logs, tab_settings = st.tabs(
-        ["账户曲线", "实时仓位", "妖币榜", "交易卡", "复盘建议池", "日志", "配置"]
+        ["账户曲线", "实时仓位", "妖币榜", "LLM交易卡", "复盘建议池", "日志", "配置"]
     )
 
     with tab_account:
@@ -265,7 +265,7 @@ def main():
         st.dataframe(candidates, use_container_width=True, hide_index=True)
 
     with tab_trades:
-        st.markdown("### 最新规则交易卡")
+        st.markdown("### 最新 LLM 交易卡")
         latest_trades = read_table("select * from trades order by id desc limit 1")
         render_trade_card(latest_trades.iloc[0].to_dict() if not latest_trades.empty else {})
         st.markdown("### 历史交易卡")
@@ -281,7 +281,7 @@ def main():
         st.dataframe(trades, use_container_width=True, hide_index=True)
 
     with tab_reviews:
-        st.markdown("### 亏损复盘建议池")
+        st.markdown("### 失败复盘建议池")
         reviews = read_table(
             """
             select time_utc, symbol, realized_pnl, summary, likely_causes,
@@ -292,7 +292,7 @@ def main():
             """
         )
         if reviews.empty:
-            st.info("还没有真实亏损复盘。只有真实亏损平仓后，LLM 才会在这里写建议。")
+            st.info("还没有失败复盘。模拟盘失败或真实亏损平仓后，LLM 会在这里写建议。")
         else:
             st.dataframe(reviews, use_container_width=True, hide_index=True)
 
@@ -308,7 +308,7 @@ def main():
             "trading": cfg.get("trading", {}),
             "risk": cfg.get("risk", {}),
             "screener": cfg.get("screener", {}),
-            "llm_role": "只做真实亏损复盘，不参与实时开仓",
+            "llm_role": "开仓决策 + 失败复盘",
             "llm_model": os.environ.get("LLM_MODEL", cfg.get("ai", {}).get("model", "")),
             "llm_base_url": os.environ.get("LLM_BASE_URL", ""),
             "bot_container": BOT_CONTAINER_NAME,
