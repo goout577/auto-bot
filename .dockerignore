@@ -1,0 +1,11 @@
+.git
+.env
+__pycache__/
+*.pyc
+logs/
+data/
+state.json
+venv/
+env/
+.venv/
+debug-chrome/

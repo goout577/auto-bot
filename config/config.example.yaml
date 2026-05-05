@@ -1,38 +1,45 @@
 exchange:
-  api_key: "YOUR_EXCHANGE_API_KEY"
-  secret_key: "YOUR_EXCHANGE_SECRET_KEY"
-  passphrase: "YOUR_EXCHANGE_PASSPHRASE"
-  testnet: true          # true=模拟盘，false=实盘
+  testnet: true
 
 ai:
-  base_url: "https://api.anthropic.com/v1"   # 或聚合平台地址
-  api_key: "YOUR_AI_API_KEY"
-  model: "claude-opus-4-7"
+  # LLM 只做真实亏损复盘，不参与实时开仓。
+  model: "gpt-4.1-mini"
 
 proxy:
-  http: "http://127.0.0.1:7890"
-  https: "http://127.0.0.1:7890"
+  http: ""
+  https: ""
 
 external_apis:
-  cryptopanic_token: ""   # 可选，留空自动跳过
-  coingecko_demo_key: ""  # 可选，留空自动跳过
+  cryptopanic_token: ""
+  coingecko_demo_key: ""
 
 trading:
-  timeframe: "15m"
-  loop_interval_minutes: 60
-  ohlcv_limit: 100
+  execution_mode: "auto_testnet"   # auto_testnet=自动测试盘下单，advice_only=只生成规则交易卡
+  entry_style: "market"
+  timeframe: "5m"
+  confirm_timeframe: "15m"
+  loop_interval_minutes: 15
+  ohlcv_limit: 120
 
 risk:
-  max_position_pct: 30.0    # 单笔最多占权益 30%
-  max_leverage: 15
+  position_margin_pct: 10.0
+  max_open_positions: 10
+  daily_max_drawdown_pct: 20.0
+  same_symbol_cooldown_minutes: 30
+  max_leverage: 8
   min_confidence: 6
   min_balance_usdt: 8.0
-  max_open_positions: 1
+  min_stop_loss_pct: 0.3
+  max_stop_loss_pct: 12.0
+  min_reward_r: 1.5
 
 screener:
-  min_volume_24h_usdt: 5000000
+  mode: "short_squeeze_yaobi"
+  min_volume_24h_usdt: 1000000
   max_contract_notional_usdt: 200.0
-  top_n: 10
+  scan_top_n: 40
+  ai_top_n: 20
+  min_yaobi_score: 55
   excluded_bases:
     - BTC
     - ETH

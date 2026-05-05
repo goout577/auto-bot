@@ -1,5 +1,6 @@
 # Sensitive config (use config.example.yaml as template)
 config/config.yaml
+.env
 
 # Chrome debug profile (contains cookies, login data, session data)
 debug-chrome/
@@ -7,6 +8,10 @@ debug-chrome/
 # Runtime state and logs
 state.json
 logs/
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+!state.example.json
 
 # Python cache
 __pycache__/

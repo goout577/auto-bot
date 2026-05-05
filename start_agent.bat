@@ -1,3 +1,3 @@
 @echo off
-cd /d "D:\ClaudeProjects\yaobi"
+cd /d "%~dp0"
 python loop.py

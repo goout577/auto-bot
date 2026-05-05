@@ -1,0 +1,33 @@
+services:
+  bot:
+    build: .
+    container_name: yaobi-bot
+    command: python loop.py
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./state.json:/app/state.json
+      - ./config:/app/config:ro
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    container_name: yaobi-dashboard
+    command: streamlit run dashboard.py --server.address 0.0.0.0 --server.port 8501 --server.headless true
+    env_file:
+      - .env
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs:ro
+      - ./state.json:/app/state.json
+      - ./config:/app/config:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "18601:8501"
+    restart: unless-stopped

@@ -1,145 +1,250 @@
+import json
 import os
 import sys
-import json
 import time
-import yaml
 from datetime import datetime, timezone
+
+import yaml
 from loguru import logger
 
-# Windows 控制台 UTF-8 输出
-if sys.platform == 'win32':
-    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from core.exchange import OKXExchange
-from collectors.screener import screen_symbols
-from collectors.market import fetch_market_snapshots
-from collectors.sentiment import get_fear_greed, get_crypto_news
-from collectors.onchain import get_defi_tvl, get_market_overview
-from agent.context_builder import build_context
-from agent.brain import make_decision
+from agent.brain import review_loss_trade
+from agent.context_builder import format_trade_card
 from agent.executor import execute
+from agent.loss_tracker import detect_closed_losses, register_open_trade
+from agent.rule_engine import build_rule_trade_card
+from collectors.market import fetch_market_snapshots
+from collectors.screener import screen_symbols
+from core.env_loader import apply_env_config, load_env_file
+from core.exchange import OKXExchange
 from core.risk import validate_decision
+from core.storage import init_db, record_account_snapshot, record_cycle, record_loss_review
 
-STATE_FILE = 'state.json'
+STATE_FILE = "state.json"
+CONFIG_FILE = "config/config.yaml"
+CONFIG_EXAMPLE_FILE = "config/config.example.yaml"
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def load_state() -> dict:
     try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
+        with open(STATE_FILE, encoding="utf-8") as f:
+            state = json.load(f)
     except Exception:
-        return {'last_run_utc': None, 'cycle_count': 0, 'last_action': None}
+        state = {}
+    state.setdefault("last_run_utc", None)
+    state.setdefault("cycle_count", 0)
+    state.setdefault("last_action", None)
+    state.setdefault("cooldowns", {})
+    state.setdefault("trade_records", [])
+    state.setdefault("open_trades", {})
+    state.setdefault("closed_trades", [])
+    state.setdefault("consecutive_losses", 0)
+    return state
 
 
 def save_state(state: dict):
-    with open(STATE_FILE, 'w') as f:
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=2, ensure_ascii=False)
 
 
-def run_once(exchange: OKXExchange, cfg: dict, state: dict):
-    logger.info(f"=== 第 {state['cycle_count'] + 1} 轮决策循环开始 ===")
+def load_config() -> dict:
+    load_env_file(".env")
+    config_path = CONFIG_FILE if os.path.exists(CONFIG_FILE) else CONFIG_EXAMPLE_FILE
+    if not os.path.exists(config_path):
+        raise FileNotFoundError("Missing config/config.example.yaml")
+    with open(config_path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    return apply_env_config(cfg)
 
-    equity = exchange.get_equity()
-    balance = exchange.get_free_balance()
-    positions = exchange.get_positions()
-    logger.info(f"权益: ${equity:.2f} | 可用: ${balance:.2f} | 持仓: {len(positions)} 个")
 
-    candidates = screen_symbols(exchange, cfg['screener'])
-    candidates = fetch_market_snapshots(exchange, candidates, cfg['trading'])
-
-    sentiment = get_fear_greed()
-    news = get_crypto_news(cfg['external_apis'].get('cryptopanic_token', ''))
-    defi = get_defi_tvl()
-    market_overview = get_market_overview(cfg['external_apis'].get('coingecko_demo_key', ''))
-
-    context = build_context(
-        equity, balance, positions,
-        candidates, sentiment, news, defi, market_overview,
-        cfg['risk']
-    )
-
-    decision = make_decision(context, cfg['ai'])
-    logger.info(
-        f"决策: {decision.get('action')} | "
-        f"信心: {decision.get('confidence')} | "
-        f"理由: {decision.get('reasoning', '')}"
-    )
-
-    valid, reason = validate_decision(decision, equity, positions, cfg['risk'])
-    if not valid:
-        logger.info(f"风控拦截: {reason}")
-        result = {'status': 'blocked', 'reason': reason}
+def refresh_daily_state(state: dict, equity: float):
+    today = _now().date().isoformat()
+    if state.get("day") != today:
+        state["day"] = today
+        state["day_start_equity"] = equity
+        state["day_low_equity"] = equity
+        state["consecutive_losses"] = 0
     else:
-        result = execute(decision, exchange)
-        logger.info(f"执行结果: {result}")
+        state["day_low_equity"] = min(float(state.get("day_low_equity") or equity), equity)
 
-    state['cycle_count'] += 1
-    state['last_run_utc'] = datetime.now(timezone.utc).isoformat()
-    state['last_action'] = decision.get('action')
+
+def update_after_result(state: dict, decision: dict, result: dict, equity_before: float, equity_after: float):
+    action = decision.get("action")
+    if action in ("open_long", "open_short") and decision.get("symbol") and result.get("status") in ("opened", "advice_only"):
+        state.setdefault("cooldowns", {})[f"{decision['symbol']}:{action}"] = _now().isoformat()
+
+    record = {
+        "time_utc": _now().isoformat(),
+        "decision": decision,
+        "result": result,
+        "equity_before": equity_before,
+        "equity_after": equity_after,
+    }
+    state.setdefault("trade_records", []).append(record)
+    state["trade_records"] = state["trade_records"][-500:]
+
+
+def _candidate_allows_open(decision: dict, candidates: list, min_score: int) -> tuple[bool, str]:
+    action = decision.get("action")
+    if action not in ("open_long", "open_short"):
+        return True, "ok"
+
+    symbol = decision.get("symbol")
+    matched = next((c for c in candidates if c.get("symbol") == symbol), None)
+    if not matched:
+        return False, f"{symbol or '-'} 不在本轮妖币候选榜，禁止开仓"
+
+    score = int(matched.get("yaobi_score") or 0)
+    if not matched.get("passed_min_score") or score < min_score:
+        return False, f"{symbol} 妖币分 {score} 未达到开仓线 {min_score}，仅记录观察"
+
+    decision["yaobi_score"] = score
+    return True, "ok"
+
+
+def review_closed_losses(exchange: OKXExchange, positions: list[dict], state: dict, cfg: dict):
+    for loss_trade in detect_closed_losses(exchange, positions, state):
+        logger.info(f"检测到真实亏损交易，触发 LLM 复盘: {loss_trade.get('symbol')} pnl={loss_trade.get('realized_pnl')}")
+        review = review_loss_trade(loss_trade, cfg["ai"])
+        record_loss_review(time_utc=_now().isoformat(), trade=loss_trade, review=review)
+
+
+def run_once(exchange: OKXExchange, cfg: dict, state: dict):
+    logger.info(f"=== Cycle {state['cycle_count'] + 1}: yaobi short-squeeze scan ===")
+
+    account = exchange.get_usdt_account_snapshot()
+    equity = float(account.get("equity") or 0)
+    balance = float(account.get("free") or 0)
+    positions = exchange.get_usdt_positions()
+    refresh_daily_state(state, equity)
+    record_account_snapshot(time_utc=_now().isoformat(), account=account, positions=positions)
+    review_closed_losses(exchange, positions, state, cfg)
+
+    logger.info(
+        f"equity=${equity:.2f} | free=${balance:.2f} | positions={len(positions)}/"
+        f"{cfg['risk'].get('max_open_positions', 10)} | day_start=${float(state['day_start_equity']):.2f}"
+    )
+
+    candidates = screen_symbols(exchange, cfg["screener"])
+    candidates = fetch_market_snapshots(exchange, candidates, cfg["trading"], cfg["screener"])
+
+    decision = build_rule_trade_card(candidates, cfg["risk"], cfg["screener"])
+    logger.info("\n" + format_trade_card(decision))
+
+    min_score = int(cfg.get("screener", {}).get("min_yaobi_score", 55))
+    valid, reason = _candidate_allows_open(decision, candidates, min_score)
+    if valid:
+        valid, reason = validate_decision(decision, equity, positions, cfg["risk"], state)
+
+    if not valid:
+        logger.info(f"risk blocked: {reason}")
+        result = {"status": "blocked", "reason": reason}
+    else:
+        execution_mode = cfg["trading"].get("execution_mode", "auto_testnet")
+        if execution_mode == "advice_only":
+            result = {"status": "advice_only"}
+        else:
+            result = execute(decision, exchange, cfg["risk"])
+        logger.info("\n" + format_trade_card(decision, result))
+        logger.info(f"execution result: {result}")
+
+    register_open_trade(state, decision, result, candidates)
+
+    record_cycle(
+        time_utc=_now().isoformat(),
+        cycle_count=state["cycle_count"] + 1,
+        equity=equity,
+        balance=balance,
+        positions_count=len(positions),
+        state=state,
+        candidates=candidates,
+        decision=decision,
+        result=result,
+        account=account,
+        positions=positions,
+    )
+
+    equity_after = exchange.get_equity()
+    refresh_daily_state(state, equity_after)
+    update_after_result(state, decision, result, equity, equity_after)
+
+    state["cycle_count"] += 1
+    state["last_run_utc"] = _now().isoformat()
+    state["last_action"] = decision.get("action")
     save_state(state)
     return result
 
 
 def wait_for_next_cycle(state: dict, interval_sec: int):
-    last_run = state.get('last_run_utc')
+    last_run = state.get("last_run_utc")
     if not last_run:
         return
     try:
         last_dt = datetime.fromisoformat(last_run)
-        elapsed = (datetime.now(timezone.utc) - last_dt).total_seconds()
+        elapsed = (_now() - last_dt).total_seconds()
         remaining = interval_sec - elapsed
         if remaining > 30:
-            logger.info(f"重启恢复：距上次运行 {int(elapsed//60)}分钟，等待 {int(remaining//60)}分{int(remaining%60)}秒后继续")
+            logger.info(f"resume wait: last run {int(elapsed // 60)} min ago, wait {int(remaining // 60)} min")
             time.sleep(remaining)
     except Exception:
         pass
 
 
 def main():
-    os.makedirs('logs', exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
     logger.add(
-        'logs/agent_{time:YYYY-MM-DD}.log',
-        rotation='00:00',
-        retention='7 days',
-        level='INFO',
-        encoding='utf-8',
+        "logs/agent_{time:YYYY-MM-DD}.log",
+        rotation="00:00",
+        retention="14 days",
+        level="INFO",
+        encoding="utf-8",
     )
 
-    with open('config/config.yaml', encoding='utf-8') as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config()
+    init_db()
 
-    # 代理设置（让 requests 库的所有 HTTP 请求都走代理）
-    proxy = cfg.get('proxy', {})
-    if proxy.get('http'):
-        os.environ['HTTP_PROXY'] = proxy['http']
-        os.environ['HTTPS_PROXY'] = proxy.get('https', proxy['http'])
-        logger.info(f"代理: {proxy['http']}")
+    proxy = cfg.get("proxy", {})
+    if proxy.get("http"):
+        os.environ["HTTP_PROXY"] = proxy["http"]
+        os.environ["HTTPS_PROXY"] = proxy.get("https", proxy["http"])
+        logger.info(f"proxy: {proxy['http']}")
+
+    testnet = cfg["exchange"].get("testnet", True)
+    if not testnet:
+        raise RuntimeError("This build is locked to OKX testnet. Do not enable live trading here.")
 
     state = load_state()
-    interval_sec = int(cfg['trading']['loop_interval_minutes']) * 60
-    testnet = cfg['exchange'].get('testnet', True)
+    interval_sec = int(cfg["trading"]["loop_interval_minutes"]) * 60
 
-    logger.info(f"Agent 启动 | 模式: {'模拟盘' if testnet else '实盘'} | 间隔: {interval_sec//60}分钟")
-    logger.info(f"历史轮次: {state['cycle_count']} | 上次操作: {state.get('last_action', '无')}")
+    logger.info(
+        f"agent start | mode=OKX testnet | execution={cfg['trading'].get('execution_mode', 'auto_testnet')} "
+        f"| interval={interval_sec // 60} min | llm_role=loss_review | llm={cfg['ai'].get('model')}"
+    )
+    logger.info(f"history cycles: {state['cycle_count']} | last action: {state.get('last_action', 'none')}")
 
-    # 重启后，如果距上次运行不足一个间隔，等待补齐
     wait_for_next_cycle(state, interval_sec)
 
-    exchange = OKXExchange(cfg['exchange'], proxy=cfg.get('proxy', {}))
+    exchange = OKXExchange(cfg["exchange"], proxy=cfg.get("proxy", {}))
 
     while True:
         try:
             run_once(exchange, cfg, state)
         except KeyboardInterrupt:
-            logger.info("用户手动停止 Agent。")
+            logger.info("user stopped agent")
             break
         except Exception:
-            logger.exception("循环异常")
+            logger.exception("cycle error")
 
-        logger.info(f"等待 {interval_sec//60} 分钟后进入下一轮...")
+        logger.info(f"wait {interval_sec // 60} min before next cycle")
         time.sleep(interval_sec)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
